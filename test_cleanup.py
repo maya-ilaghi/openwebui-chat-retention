@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
+import cleanup
 from cleanup import DEFAULT_DATABASE, SECONDS_PER_DAY, delete_stale_conversations, parse_args
 
 logging.disable(logging.CRITICAL)
@@ -134,6 +136,52 @@ class CleanupTest(unittest.TestCase):
         for argv in (["--days", "0"], ["--every", "0"]):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 parse_args(argv)
+
+    def try_new_message_during_check(self, chat_id):
+        """Patch the stale check so that, right after it runs, another connection (standing in for
+        the Open WebUI server) tries to save a new message. Returns the outcome of that attempt."""
+        outcome = {}
+        original_check = cleanup.find_stale_conversations
+
+        def check_then_write(connection, cutoff_timestamp):
+            stale = original_check(connection, cutoff_timestamp)
+            server = sqlite3.connect(self.database, timeout=0)  # fail immediately instead of waiting
+            try:
+                with server:
+                    server.execute(
+                        "INSERT INTO chat_message (id, chat_id, created_at) VALUES ('new', ?, ?)",
+                        (chat_id, self.NOW),
+                    )
+                outcome["written"] = True
+            except sqlite3.OperationalError as error:
+                outcome["error"] = str(error)
+            finally:
+                server.close()
+            return stale
+
+        return outcome, check_then_write
+
+    def test_no_message_can_be_saved_between_check_and_delete(self):
+        self.add_chat("stale", [5])
+        outcome, check_then_write = self.try_new_message_during_check("stale")
+
+        with mock.patch("cleanup.find_stale_conversations", check_then_write):
+            deleted = delete_stale_conversations(self.database, 3, now_timestamp=self.NOW)
+
+        # The write lock is held from before the check until the commit: the new message is refused
+        # (the server would wait and retry), so a chat is never deleted right after becoming active.
+        self.assertEqual("database is locked", outcome.get("error"))
+        self.assertEqual(1, deleted)
+        self.assertEqual(0, self.count("chat", "stale"))
+
+    def test_dry_run_does_not_block_the_server(self):
+        self.add_chat("stale", [5])
+        outcome, check_then_write = self.try_new_message_during_check("stale")
+
+        with mock.patch("cleanup.find_stale_conversations", check_then_write):
+            delete_stale_conversations(self.database, 3, dry_run=True, now_timestamp=self.NOW)
+
+        self.assertTrue(outcome.get("written"))
 
 
 class ProvidedDatabaseTest(unittest.TestCase):

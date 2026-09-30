@@ -58,20 +58,31 @@ def delete_stale_conversations(
     with contextlib.closing(sqlite3.connect(database_path, timeout=LOCK_TIMEOUT_SECONDS)) as connection:
         # Must be enabled per connection: cascades the delete to chat_message, shared_chat and chat_file.
         connection.execute("PRAGMA foreign_keys = ON")
-        stale_conversations = find_stale_conversations(connection, cutoff_timestamp)
 
-        # Log ids and dates only: titles are derived from user content, so they are personal data too.
-        for chat_id, last_activity in stale_conversations:
-            log.info("%s %s (last activity %s)", "Would delete" if dry_run else "Deleting", chat_id, iso(last_activity))
+        if dry_run:
+            # Read only: no write lock, so the dry run never blocks the server.
+            stale_conversations = find_stale_conversations(connection, cutoff_timestamp)
+            log_conversations("Would delete", stale_conversations)
+            return len(stale_conversations)
 
-        if not dry_run:
-            with connection:  # one transaction: all stale chats are deleted, or none
-                connection.executemany(
-                    "DELETE FROM chat WHERE id = ?",
-                    [(chat_id,) for chat_id, _ in stale_conversations],
-                )
+        # BEGIN IMMEDIATE takes the write lock *before* the check, so the server cannot save a new
+        # message between finding a stale chat and deleting it. Other writers wait until we commit.
+        connection.execute("BEGIN IMMEDIATE")
+        with connection:  # commit on success, roll back on any error: all stale chats are deleted, or none
+            stale_conversations = find_stale_conversations(connection, cutoff_timestamp)
+            log_conversations("Deleting", stale_conversations)
+            connection.executemany(
+                "DELETE FROM chat WHERE id = ?",
+                [(chat_id,) for chat_id, _ in stale_conversations],
+            )
 
     return len(stale_conversations)
+
+
+def log_conversations(action: str, conversations) -> None:
+    # Ids and dates only: titles are derived from user content, so they are personal data too.
+    for chat_id, last_activity in conversations:
+        log.info("%s %s (last activity %s)", action, chat_id, iso(last_activity))
 
 
 def iso(timestamp: int) -> str:
